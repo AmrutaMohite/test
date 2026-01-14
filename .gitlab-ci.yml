@@ -1,0 +1,97 @@
+# Generic GitLab CI template for small projects (Node / Python / Docker)
+# Drop this in the repository root as .gitlab-ci.yml
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  GIT_STRATEGY: clone
+  # DO NOT set DOCKER_TLS_CERTDIR here if using docker:dind (we disable it below in jobs that use dind)
+
+# ---- Test job: auto-detect Node or Python and run tests if present ----
+test:
+  stage: test
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache bash git
+    # Install interpreters as needed (keeps base image small)
+    - |
+      if [ -f package.json ]; then
+        apk add --no-cache nodejs npm
+      elif [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+        apk add --no-cache python3 py3-pip
+      fi
+  script:
+    - |
+      echo "Detecting project type..."
+      if [ -f package.json ]; then
+        echo "Node project detected"
+        npm ci || true
+        if npm run | grep -q "test"; then
+          echo "Running npm test"
+          npm test
+        else
+          echo "No npm test script found"
+        fi
+      elif [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+        echo "Python project detected"
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if python -m pytest -q; then
+          echo "pytest passed"
+        else
+          echo "pytest not found or failed (ignored if none)"
+        fi
+      else
+        echo "No recognized project files (package.json, requirements.txt, pyproject.toml). Nothing to test."
+      fi
+
+# ---- Optional Docker build job (requires Docker-in-Docker) ----
+docker-build:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - name: docker:24.0.5-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker info
+  script:
+    - |
+      if [ -f Dockerfile ]; then
+        echo "Building Docker image..."
+        docker build -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" .
+        echo "Docker image built: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+      else
+        echo "No Dockerfile found — skipping docker build"
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success
+    - when: manual
+  allow_failure: true
+
+# ---- Optional deploy: push image to GitLab Container Registry (manual) ----
+deploy:
+  stage: deploy
+  image: docker:24.0.5
+  dependencies:
+    - docker-build
+  script:
+    - |
+      if [ -z "$CI_REGISTRY" ]; then
+        echo "CI_REGISTRY not defined. Skipping push."
+        exit 0
+      fi
+      if [ -z "$CI_REGISTRY_USER" ] || [ -z "$CI_REGISTRY_PASSWORD" ]; then
+        echo "CI_REGISTRY_USER/CI_REGISTRY_PASSWORD not set. Configure them in project CI/CD variables to push images."
+        exit 0
+      fi
+      echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" "$CI_REGISTRY" --password-stdin
+      docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+  when: manual
+  only:
+    - main
+  allow_failure: true
